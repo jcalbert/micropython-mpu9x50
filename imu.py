@@ -60,6 +60,164 @@ def bytes_toint(msb, lsb):
     return - (((msb ^ 255) << 8) | (lsb ^ 255) + 1)
 
 
+@property
+def sample_rate(self):
+    '''
+    Get sample rate as per Register Map document section 4.4
+    SAMPLE_RATE= Internal_Sample_Rate / (1 + rate)
+    default rate is zero i.e. sample at internal rate.
+    '''
+    try:
+        self._read(self.buf1, 0x19, self.mpu_addr)
+        return self.buf1[0]
+    except OSError:
+        raise MPUException(self._I2Cerror)
+
+@sample_rate.setter
+def sample_rate(self, rate):
+    '''
+    Set sample rate as per Register Map document section 4.4
+    '''
+    if rate < 0 or rate > 255:
+        raise ValueError("Rate must be in range 0-255")
+    try:
+        self._write(rate, 0x19, self.mpu_addr)
+    except OSError:
+        raise MPUException(self._I2Cerror)
+
+
+class MPU_FIFO(object):
+    '''
+    Class for using the mpu's FIFO buffer.
+    For now only supports native sensors (not i2c slaves)
+    '''
+
+    def __init__(self, mpu):
+        self.mpu = mpu
+        raise NotImplementedError()
+
+    @property
+    def enabled(self):
+        try:
+            self.mpu._read(self.mpu.buf1, 0x6A, self.mpu.mpu_addr)
+            return (self.mpu.buf1[0] & 64) > 0
+        except OSError:
+            raise MPUException(self.mpu._I2Cerror)
+
+    @enabled.setter
+    def enabled(self, state):
+        try:
+            current_state = self.enabled #Also reads byte into buf1
+            if state == current_state:
+                return
+            else: #flip seventh bit
+                self._write(self.mpu.buf1[0]^64, 0x6A, self.mpu.mpu_addr)
+        except OSError:
+            raise MPUException(self.mpu._I2Cerror)
+
+    def reset(self):
+        '''
+        Clear the FIFO.
+        '''
+        try:
+            self.mpu._read(self.mpu.buf1, 0x6A, self.mpu.mpu_addr)
+            self.mpu._write(self.mpu.buf1[0] | 4, 0x6A, self.mpu.mpu_addr)
+        except OSError:
+            raise MPUException(self.mpu._I2Cerror)
+
+    @property
+    def count(self):
+        '''
+        The number of bytes stored in the FIFO.
+        Divide by the (number of active sensors * 2) for number of samples.
+        '''
+        try:
+            self.mpu._read(self.mpu.buf2, 0x72, self.mpu.mpu_addr)
+        except OSError:
+            raise MPUException(self.mpu._I2Cerror)
+        return (self.mpu.buf2[0] << 8 + self.mpu.buf2[1]) #16bit uint
+
+    @property
+    def sensors(self):
+        '''
+        Get sensors writing to the fifo.
+        Bit:         7        6 5 4       3             2 1 0
+        Sensor:  (Temp) (Gyro X Y Z) (Accel) (I2C Slave 2 1 0)
+        '''
+        try:
+            self.mpu._read(self.mpu.buf1, 0x6A, self.mpu.mpu_addr)
+        except OSError:
+            raise MPUException(self.mpu._I2Cerror)
+
+        return self.mpu.buf1[0]
+        #return tuple((self.mpu.buf1[0] &  (1 << i)) > 0 for i in range(8))
+
+    @sensors.setter
+    def sensors(self, state):
+        '''
+        Set sensors writing to the fifo.  For now, accepts a byte,
+        but maybe an iterable-of-bools would be better.
+
+        Note: setting enabled sensors resets the FIFO buffer.
+        '''
+        if state < 0 or state > 255:
+            raise ValueError('Sensor choice must be between 0 and 255.')
+        if (state & 7) > 0:
+            raise ValueError('Slave I2C Devices are not yet supported by FIFO')
+
+        try:
+            self.mpu._write(state, 0x6A, self.mpu.mpu_addr)
+            self.reset()
+        except OSError:
+            raise MPUException(self._I2Cerror)
+
+    def _get_two_bytes(self):
+        try:
+            self.mpu._read(self.mpu.buf2, 0x74, self.mpu.mpu_addr)
+        except:
+            raise MPUException(self.mpu._I2Cerror)
+
+    def read_one(self, fifo_sensors = None):
+        '''
+        Read in one frame's worth of buffer data
+        '''
+        if fifo_sensors is None:
+            fifo_sensors = self.sensors
+        out = []
+
+        if (fifo_sensors >> 7) & 1: #Temperature
+            self._get_two_bytes()
+            out.append(bytes_toint(self.mpu.buf2[0], self.mpu.buf2[1])/340 + 35)  # They think
+
+        scale = (131, 65.5, 32.8, 16.4)
+        for i, shift in enumerate((6,5,4)):
+            if (fifo_sensors >> shift) & 1: #Gyro X,Y,Z
+                self._get_two_bytes()
+                self._gyro._ivector[i] = bytes_toint(self.buf2[0], self.buf2[1])
+                self._gyro._vector[i] = self._gyro._ivector[i]/scale[self.gyro_range]
+                out.append(self._gyro._vector)
+
+        scale = (16384, 8192, 4096, 2048)
+        if (fifo_sensors >> 3) & 1: #All Acceleration
+            for i in range(3):
+                self._accel._ivector[i] = bytes_toint(self.buf2[0], self.buf2[1])
+                self._accel._vector[i] = self._accel._ivector[i]/scale[self.accel_range]
+                out.append(self._accel._vector)
+
+    def read_all(self):
+        '''
+        Read in the full contents of the fifo buffer.
+        '''
+        self.enabled(False)
+
+        fifo_sensors = self.sensors
+        n_sensors = sum((fifo_sensors >> i) & 1 for i in range(8))
+
+        for i in range(self.count / (n_sensors * 2)):
+            yield self.read_one(fifo_sensors)
+
+        self.enabled(True)
+
 class MPU6050(object):
     '''
     Module for InvenSense IMUs. Base class implements MPU6050 6DOF sensor, with
