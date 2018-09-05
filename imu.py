@@ -60,32 +60,6 @@ def bytes_toint(msb, lsb):
     return - (((msb ^ 255) << 8) | (lsb ^ 255) + 1)
 
 
-@property
-def sample_rate(self):
-    '''
-    Get sample rate as per Register Map document section 4.4
-    SAMPLE_RATE= Internal_Sample_Rate / (1 + rate)
-    default rate is zero i.e. sample at internal rate.
-    '''
-    try:
-        self._read(self.buf1, 0x19, self.mpu_addr)
-        return self.buf1[0]
-    except OSError:
-        raise MPUException(self._I2Cerror)
-
-@sample_rate.setter
-def sample_rate(self, rate):
-    '''
-    Set sample rate as per Register Map document section 4.4
-    '''
-    if rate < 0 or rate > 255:
-        raise ValueError("Rate must be in range 0-255")
-    try:
-        self._write(rate, 0x19, self.mpu_addr)
-    except OSError:
-        raise MPUException(self._I2Cerror)
-
-
 class MPU_FIFO(object):
     '''
     Class for using the mpu's FIFO buffer.
@@ -94,7 +68,7 @@ class MPU_FIFO(object):
 
     def __init__(self, mpu):
         self.mpu = mpu
-        raise NotImplementedError()
+        #raise NotImplementedError()
 
     @property
     def enabled(self):
@@ -111,7 +85,7 @@ class MPU_FIFO(object):
             if state == current_state:
                 return
             else: #flip seventh bit
-                self._write(self.mpu.buf1[0]^64, 0x6A, self.mpu.mpu_addr)
+                self.mpu._write(self.mpu.buf1[0]^64, 0x6A, self.mpu.mpu_addr)
         except OSError:
             raise MPUException(self.mpu._I2Cerror)
 
@@ -135,7 +109,7 @@ class MPU_FIFO(object):
             self.mpu._read(self.mpu.buf2, 0x72, self.mpu.mpu_addr)
         except OSError:
             raise MPUException(self.mpu._I2Cerror)
-        return (self.mpu.buf2[0] << 8 + self.mpu.buf2[1]) #16bit uint
+        return (self.mpu.buf2[0] << 8 | self.mpu.buf2[1]) #16bit uint
 
     @property
     def sensors(self):
@@ -145,7 +119,7 @@ class MPU_FIFO(object):
         Sensor:  (Temp) (Gyro X Y Z) (Accel) (I2C Slave 2 1 0)
         '''
         try:
-            self.mpu._read(self.mpu.buf1, 0x6A, self.mpu.mpu_addr)
+            self.mpu._read(self.mpu.buf1, 0x23, self.mpu.mpu_addr)
         except OSError:
             raise MPUException(self.mpu._I2Cerror)
 
@@ -166,7 +140,7 @@ class MPU_FIFO(object):
             raise ValueError('Slave I2C Devices are not yet supported by FIFO')
 
         try:
-            self.mpu._write(state, 0x6A, self.mpu.mpu_addr)
+            self.mpu._write(state, 0x23, self.mpu.mpu_addr)
             self.reset()
         except OSError:
             raise MPUException(self._I2Cerror)
@@ -183,32 +157,43 @@ class MPU_FIFO(object):
         '''
         if fifo_sensors is None:
             fifo_sensors = self.sensors
-        out = []
 
-        if (fifo_sensors >> 7) & 1: #Temperature
+        out = []
+        
+        #Temperature
+        if (fifo_sensors >> 7) & 1:
             self._get_two_bytes()
             out.append(bytes_toint(self.mpu.buf2[0], self.mpu.buf2[1])/340 + 35)  # They think
 
-        scale = (131, 65.5, 32.8, 16.4)
-        for i, shift in enumerate((6,5,4)):
-            if (fifo_sensors >> shift) & 1: #Gyro X,Y,Z
-                self._get_two_bytes()
-                self._gyro._ivector[i] = bytes_toint(self.buf2[0], self.buf2[1])
-                self._gyro._vector[i] = self._gyro._ivector[i]/scale[self.gyro_range]
-                out.append(self._gyro._vector)
+        #Gyros
+        if (fifo_sensors & 0b01110000) > 0:
+            scale = (131, 65.5, 32.8, 16.4)[self.mpu.gyro_range]
+            for i, shift in enumerate((6,5,4)):
+                if (fifo_sensors >> shift) & 1: #Gyro X,Y,Z
+                    self._get_two_bytes()
+                    this_int =  bytes_toint(self.mpu.buf2[0], self.mpu.buf2[1])
+                    this_val = this_int / scale
+                    this_val -= self.mpu._gyro.cal[i]
+                    this_val *= self.mpu._gyro.scale[i]
+                    out.append(this_val)
 
-        scale = (16384, 8192, 4096, 2048)
+        #Accels (all in one)
         if (fifo_sensors >> 3) & 1: #All Acceleration
+            scale = (16384, 8192, 4096, 2048)[self.mpu.accel_range]
             for i in range(3):
-                self._accel._ivector[i] = bytes_toint(self.buf2[0], self.buf2[1])
-                self._accel._vector[i] = self._accel._ivector[i]/scale[self.accel_range]
-                out.append(self._accel._vector)
-
+                self._get_two_bytes()
+                this_int =  bytes_toint(self.mpu.buf2[0], self.mpu.buf2[1])
+                this_val = this_int / scale
+                this_val -= self.mpu._accel.cal[i]
+                this_val *= self.mpu._accel.scale[i]
+                out.append(this_val)
+        
+        return out
     def read_all(self):
         '''
         Read in the full contents of the fifo buffer.
         '''
-        self.enabled(False)
+#        self.enabled = False
 
         fifo_sensors = self.sensors
         n_sensors = sum((fifo_sensors >> i) & 1 for i in range(8))
@@ -216,7 +201,8 @@ class MPU_FIFO(object):
         for i in range(self.count / (n_sensors * 2)):
             yield self.read_one(fifo_sensors)
 
-        self.enabled(True)
+#        self.reset()
+#        self.enabled = True
 
 class MPU6050(object):
     '''
@@ -230,6 +216,8 @@ class MPU6050(object):
 
     def __init__(self, side_str, device_addr=None, transposition=(0, 1, 2), scaling=(1, 1, 1)):
 
+        self.fifo = MPU_FIFO(self)
+        
         self._accel = Vector3d(transposition, scaling, self._accel_callback)
         self._gyro = Vector3d(transposition, scaling, self._gyro_callback)
         self.buf1 = bytearray(1)                # Pre-allocated buffers for reads: allows reads to
