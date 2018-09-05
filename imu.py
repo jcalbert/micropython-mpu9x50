@@ -233,6 +233,21 @@ class MPU6050(object):
         except OSError:
             raise MPUException(self._I2Cerror)
 
+    @property
+    def sample_hz(self):
+        '''
+        Get the real-life sample rate from the MPU's settings.
+        '''    
+        try:
+            self._read(self.buf1, 0x1A, self.mpu_addr)
+        except OSError:
+            raise MPUException(self._I2Cerror)
+        
+        if 0 < (self.buf1[0] & 7) < 7: #Lowpass is on, gyro rate is 1kHz
+            return 1000. / (1 + self.sample_rate)
+        else: #Lowpass is off, gyro rate is 8kHz
+            return 8000. / (1 + self.sample_rate)
+
     # Low pass filters. Using the filter_range property of the MPU9250 is
     # harmless but gyro_filter_range is preferred and offers an extra setting.
     @property
